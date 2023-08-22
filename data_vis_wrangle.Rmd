@@ -1,0 +1,441 @@
+---
+title: "USGS ECO Example Data Wrangle and Vis"
+author: "Bryce Pulver"
+date: "2023-07-31"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = TRUE, results='hide', warning=FALSE, message=FALSE}
+library(tidyverse)
+library(arrow)
+library(aws.s3)
+library(aws.ec2metadata)
+library(sf)
+library(lubridate)
+library(nhdplusTools)
+library(gifski)
+library(gganimate)
+library(maps)
+library(mapdata)
+library(transformr)
+library(gridExtra)
+library(cowplot)
+
+# Since we have some random data sets
+set.seed(8)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Data Wrangling
+
+## Whole output of neural network daily drought prediction data
+
+Data can be found here: (drought-dev/ungauged_model_output) [https://s3.console.aws.amazon.com/s3/buckets/drought-dev?region=us-west-2&prefix=ungauged_model_output/&showversions=false]
+```{r results='hide'}
+# Creating directory
+dir.create("data/parquet")
+
+# Before the data is put into RAM and R's environment you can use tidyverse and some lubridate functions to make selections and filter a parquet file.
+nn_prediction <- open_dataset('data/parquet', format = 'parquet') %>%
+filter(year %in% 2017:2019) %>%  #only interested in this drought event
+  mutate(predicted_class = if_else(predicted < 20,
+                                   print('Drought'),
+                                   print('Not_Drought'))) %>% #creating discrete drought class
+collect() # using this brings any arrow type file into the work space
+       
+# Some functions are not allowed on the read in of arrow data. days_in_month() is one that is not supported and needs to used after the read-in is collected using collect().
+nn_prediction <- nn_prediction %>% 
+  mutate(days_in_month = days_in_month(Date))
+
+```
+ 
+## Summary of neural network monthly drought prediction data
+```{r}
+# This section of code creates a monthly % of days in drought.
+nn_month_sum <- nn_prediction %>%
+       group_by(nhgf_id, year, month, smoothing, predicted_class, days_in_month) %>%
+summarize(drought_count = n()) %>%
+mutate(perc_drought_days = if_else(predicted_class == "Not_Drought",
+                                   0,
+                                   drought_count/days_in_month), 
+      date = make_date(year, month),
+      date = str_sub(date, 1, -4)) %>% 
+  mutate_at(c("perc_drought_days"), ~na_if(.,0)) %>% 
+  rename(hru_segmen = nhgf_id)
+
+
+```
+
+# Mapping Preperation
+
+## Our data read in. 
+
+These files can be found here: (drought-dev/ungauged_model_eco_data)[https://s3.console.aws.amazon.com/s3/buckets/drought-dev?prefix=ungauged_model_eco_data/&region=us-west-2]
+```{r results='hide'}
+# Creating directory
+dir.create("data/GIS")
+
+# Colorado River Basin's NHGFs
+crb <- st_read("data/GIS/CRB_shp_file/CO_NHGF11_disslv.shp") %>% 
+  st_transform(crs = 4326) %>% 
+  st_make_valid() # This is to coerce the data into
+
+check <- st_is_valid(crb)
+#This value should be 1 for Valid = TRUE
+n_distinct(check)
+
+
+# Ecology data that has sites as COMIDs
+eco_raw <- read.csv("data/GIS/ucol_ecol_sites.csv")
+
+# Cross walk table to transfer COMIDs to NHGF and vise-versa. There are cross walks for both Upper (14) and Lower (15) Colorado River Basin
+xwalk <- read.csv("data/GIS/r14_xwalk.csv") %>% 
+  rename(COMID = 2,
+         hru_segmen = 4) %>% 
+  mutate(hru_segmen = as.numeric(hru_segmen))
+
+nhgf <- st_read("data/GIS/reference_14.gpkg")
+
+```
+
+## Other datasets read in 
+```{r}
+# Using the maps package here we are grabbing state outlines
+crb_states <- st_as_sf(maps::map("state", plot = FALSE, fill = TRUE)) %>%
+filter(ID %in% c('utah', 'colorado', 'new mexico', 'arizona', 'wyoming', 'california', 'nevada'))
+
+```
+
+```{r}
+# Using NHDplus Tools to grab flowlines of the Colorado River Basin
+
+#download_wbd("data/nhd")
+area <- st_as_sfc(st_bbox(crb))
+
+crb_outline <- crb %>% 
+  st_make_valid() %>% 
+  st_union()
+
+plot(st_geometry(crb_outline))
+
+# Since the study area covers two major HUCs (14 and 15) a higher stream order is used for more major rivers.
+crb_flowlines <- get_nhdplus(crb_outline, streamorder = 6)
+
+# A quick plot to check on created simple features.
+plot(st_geometry(crb))
+plot(st_geometry(crb_flowlines), add = T, lwd = (crb_flowlines$streamorde/3), col = "blue")
+plot(st_geometry(crb_states), add = T)
+
+# If you want to download NHD
+# dir.create("data/nhd")
+# download_nhdplushr("data/nhd","14")
+```
+
+# Some diffent data expoloration and mapping examples
+
+## A set of points in the basin and their polygons
+
+This will most likely be more clustered as we will see in the ecology sample set, but this section shows how to extract the polygons that will be merged with the drought predictions later on.
+
+```{r}
+# Random points that are with in the Colorado River Basin
+points_random <- st_sample(crb, 50) %>% 
+  st_as_sf()
+
+# Creating an index to get polygons 
+index_of_points <- st_intersection(crb, points_random)
+
+hru <- as.data.frame(index_of_points$hru_segmen) %>% 
+  rename(hru_segmen = 1)
+
+polygons_frm_pnts <- merge(crb, hru, by = 'hru_segmen') 
+
+# Quick plot to look at the points and NHGF shapes.
+ggplot() +
+  geom_sf(data = crb_states, fill = "grey") +
+  geom_sf(data = polygons_frm_pnts, fill = 'white', color = 'black') +
+  geom_sf(data = points_random, color = 'red', size = 2) +
+  coord_sf(xlim = c(-116.5, -105), ylim = c(30, 43.5)) 
+```
+
+
+## A set of random ecology points and their drought predictions
+```{r}
+# Creating a random sample set from the ecology data set from the BLM and USGS_ER category in the ecology data.
+eco_random <- eco_raw %>% 
+  filter(source %in% c("BLM", "USGS_ER")) %>% 
+  sample_n(50)
+
+eco_nhgf <- left_join(eco_random, xwalk, by = "COMID")
+
+
+```
+
+```{r}
+# Merging data with the crb NHGF shape file and the model output. This can be done later in the for loop to save on computing power, but this data set isn't very large.
+sf_eco_merge <- merge(crb, eco_nhgf, by = 'hru_segmen')
+
+sf_nn_merge <- merge(sf_eco_merge, nn_month_sum, by = 'hru_segmen')
+
+# Getting eco bounding box for limits and inset map
+eco_area <- st_as_sfc(st_bbox(sf_nn_merge))
+
+# Grabbing flow lines to get missing NHGF watershed 
+eco_flowlines <- get_nhdplus(eco_area, streamorder = 1)
+
+# This is to grab all of the COMIDS that have an NA in the NHGF id column
+non_nhgf_eco <- eco_nhgf %>% 
+  filter(is.na(hru_segmen))
+
+# get_UM() or get_UT can be used to grab flow lines that are upstream of the found COMIDS. Search distance can also be specified for finer search.
+new_comid_eco <- get_UM(eco_flowlines, non_nhgf_eco$COMID)
+
+# These are the flow lines from the missing NHGF
+new_nhd_eco <- get_nhdplus(comid = new_comid_eco)
+  
+
+# The next few functions are creating an index to create a shape file of the missing NHGF watersheds.
+new_nhgf_eco <- st_intersection(crb, new_nhd_eco)
+
+eco_hru <- as.data.frame(new_nhgf_eco$hru_segmen) %>% 
+  rename(hru_segmen = 1)
+
+new_nhgf_eco <- merge(crb, eco_hru, by = 'hru_segmen') %>% 
+  mutate(id = row_number())
+
+
+# A quick plot to check for flow lines and nhgf watersheds
+plot(st_geometry(sf_nn_merge), col = "yellow")
+plot(st_geometry(new_nhgf_eco), add = T, col = "green")
+plot(st_geometry(eco_flowlines), add = T, col = "blue")
+plot(st_geometry(new_nhd_eco), add = T, col = "red")
+
+```
+
+
+## Annimation of the ecosite data for drought event during 2017-2019
+
+```{r}
+# This function will extract a legend that will be used in creating our plot using grid.arrange()
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+```
+
+```{r eval = FALSE}
+# This is prep for the inset and looking at the map before running the for loop to create pngs for the gif
+dates <- unique(sf_nn_merge$date) %>% 
+  sort()
+
+st_bbox(crb_outline)
+
+# This map is to check on all of the spacing before running the for loop for each month. sf_nn_merge can be used or any placeholder data set since this will not be split by month and is only used to check on all of the spacing.
+map <-
+ggplot() +
+geom_sf(data = crb_states, fill = "grey") +
+geom_sf(data = crb_outline, fill  = "white") +
+
+geom_sf(data = sf_nn_variable, aes(fill = perc_drought_days), lwd = 0.2) +
+  geom_sf(data = crb_flowlines, color = "blue") +
+coord_sf(xlim = c(-109.007, -105.82),ylim = c(37.757, 40.148)) +
+scale_fill_gradient(na.value = 'white',
+                     low = '#e9f204',
+                     high = '#fc0606',
+                   limits = c(0,1)) +
+    labs(subtitle = "Nueral Network Ungauged Model Output for Ecosites",
+         caption = paste0("Date:", i),
+         title = 'Variable',
+         fill = "% of Drought Days") +
+    theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank(),
+        legend.position = 'bottom',
+         plot.subtitle = element_text(size = 9))
+    
+map2 <-
+ggplot() +
+geom_sf(data = crb_states, fill = "grey") +
+geom_sf(data = crb_outline, fill  = "white") +
+   
+geom_sf(data = sf_nn_fixed, aes(fill = perc_drought_days), lwd = 0.2) +
+  geom_sf(data = crb_flowlines, color = "blue") +
+coord_sf(xlim = c(-109.007, -105.82),ylim = c(37.757, 40.148)) +
+scale_fill_gradient(na.value = 'white',
+                     low = '#e9f204',
+                     high = '#fc0606',
+                   limits = c(0,1)) +
+    labs(title = 'Fixed',
+         subtitle = " ",
+         fill = "% of Drought Days") +
+  theme(legend.position="none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank())
+
+inset <- 
+ggplot() +
+geom_sf(data = crb_states, fill = "grey31") +
+geom_sf(data = crb_outline, fill  = "white") +
+  geom_sf(data = eco_area, color = "red", fill = NA, size = 5) +
+geom_sf(data = crb_flowlines, color = "blue") +
+  coord_sf(xlim = c(-115.733, -105.62), ylim = c(31.49,43.40)) +
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank())
+
+combo_map <- ggdraw() +
+  draw_plot(map2) +
+  draw_plot(inset, x = 0.72, y = -0.15, width = 0.3, height = 0.5)
+  
+# Be sure to run the g_legend() function before
+mylegend<-g_legend(map)
+
+map3 <- grid.arrange(arrangeGrob(map + theme(legend.position="none"),
+                         combo_map + theme(legend.position="none"),
+                         nrow=1),
+             mylegend, nrow=2,heights=c(12, 1))
+
+```
+
+## The for loop that creates the pngs for our gif.
+```{r eval = FALSE}
+
+for (i in dates) {
+    
+sf_nn <- sf_nn_merge %>%
+    filter(date %in% paste0(i))
+    
+sf_nn_variable <- sf_nn %>%
+    filter(smoothing == 'jd_30d_wndw')
+
+#These two commented out merges can be used if you want to merge a larger data set with the crb data. When the datasets are larger this can be computationally heavy and can be split up here or by running a smaller subset of dates by using dates[x,y]    
+#sf_nn_variable <- merge(crb, sf_nn_variable, by = 'hru_segmen')
+    
+sf_nn_fixed <- sf_nn %>%
+    filter(smoothing == 'site')
+    
+#sf_nn_fixed <- merge(crb, sf_nn_fixed, by = 'hru_segmen')
+    
+
+map <-
+ggplot() +
+geom_sf(data = crb_states, fill = "grey") +
+geom_sf(data = crb_outline, fill  = "white") +
+
+geom_sf(data = sf_nn_variable, aes(fill = perc_drought_days), lwd = 0.2) +
+  geom_sf(data = crb_flowlines, color = "blue") +
+coord_sf(xlim = c(-109.007, -105.82),ylim = c(37.757, 40.148)) +
+scale_fill_gradient(na.value = 'white',
+                     low = '#e9f204',
+                     high = '#fc0606',
+                   limits = c(0,1)) +
+    labs(title = "Nueral Network Ungauged Model Output for Ecosites",
+         caption = paste0("Date:", i),
+         subtitle = 'Variable',
+         fill = "% of Drought Days") +
+    theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank(),
+        legend.position = 'bottom',
+         plot.subtitle = element_text(size = 9))
+    
+map2 <-
+ggplot() +
+geom_sf(data = crb_states, fill = "grey") +
+geom_sf(data = crb_outline, fill  = "white") +
+   
+geom_sf(data = sf_nn_fixed, aes(fill = perc_drought_days), lwd = 0.2) +
+  geom_sf(data = crb_flowlines, color = "blue") +
+coord_sf(xlim = c(-109.007, -105.82),ylim = c(37.757, 40.148)) +
+scale_fill_gradient(na.value = 'white',
+                     low = '#e9f204',
+                     high = '#fc0606',
+                   limits = c(0,1)) +
+    labs(title = '',
+         subtitle = "Fixed",
+         fill = "% of Drought Days") +
+  theme(legend.position="none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank())
+
+inset <- 
+ggplot() +
+geom_sf(data = crb_states, fill = "grey31") +
+geom_sf(data = crb_outline, fill  = "white") +
+  geom_sf(data = eco_area, color = "red", fill = NA, size = 5) +
+geom_sf(data = crb_flowlines, color = "blue") +
+  coord_sf(xlim = c(-115.733, -105.62), ylim = c(31.49,43.40)) +
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank())
+
+combo_map <- ggdraw() +
+  draw_plot(map2) +
+  draw_plot(inset, x = 0.72, y = -0.15, width = 0.3, height = 0.5)
+  
+
+mylegend<-g_legend(map)
+
+map3 <- grid.arrange(arrangeGrob(map + theme(legend.position="none"),
+                         combo_map + theme(legend.position="none"),
+                         nrow=1),
+             mylegend, nrow=2,heights=c(12, 1))
+
+dir.create("data/png_new")    
+ggsave(map3, file=paste0("data/png_new/plot_", i,".png"), width = 20, height = 14, units = "cm")
+
+}
+```
+
+```{r eval = FALSE}
+
+png_files <- list.files("data/png_new/", pattern = ".*png$", full.names = TRUE)
+
+gifski(png_files, gif_file = "data/nn_output.gif", width = 1140, height = 800, delay = 0.3)
+
+```
+
+![Generated gif for random eco sites](https://i.imgur.com/wMIoa56.gif)
+Note: This output is for a 20% streamflow percentile and only for watersheds found with the crosswalk table.
+
+## Creating a time series for a few eco sites of the drought event.
+
+Doing some quick joining and selecting 3 random eco sites for our time series
+```{r}
+
+eco_ts_sample <- sf_nn_merge %>% 
+  sample_n(3)
+
+nn_ts_sample <- nn_prediction %>% 
+  rename(hru_segmen = nhgf_id)
+
+combo_ts <- left_join(eco_ts_sample, nn_ts_sample, by = "hru_segmen")
+
+```
+
+This is a quick faceted time series by site name and showing a 20% streamflow percentile threshold as a red line. 
+```{r warning=FALSE}
+ggplot(combo_ts, aes(x = Date, y = predicted, group = OrigSiteName, color = OrigSiteName)) +
+  geom_line(linewidth = 0.1) +
+  geom_hline(yintercept = 20, color = "red", linewidth = 1) +
+  scale_color_manual(values = c("blue","green4", "black")) +
+  scale_y_continuous(breaks = seq(0, 100, 20)) +
+  facet_wrap(~OrigSiteName, ncol = 1) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  ylab("Streamflow Percentile")
+
+```
+
